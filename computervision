@@ -1,0 +1,561 @@
+"""
+Morpheus EVA Fatigue Check (PRE/POST, individualized baseline, Excel logging)
+
+What it does:
+- Draws a visible TARGET LINE on the camera feed.
+- Measures time for RIGHT wrist to reach/cross that line.
+- PRE mode: collects a "personal baseline" (median of trials) and saves it.
+- POST mode: compares new trials to that saved baseline using % thresholds.
+- Logs every trial + each session summary to an Excel file.
+
+Install (one time):
+  python -m pip install opencv-python mediapipe numpy pandas openpyxl
+
+Controls:
+- ESC: quit
+- SPACE: next trial (optional; can be changed to automatic later)
+"""
+
+import os
+import time
+import platform
+from datetime import datetime
+
+import cv2
+import mediapipe as mp
+import numpy as np
+import pandas as pd
+
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Font, Alignment
+
+# ========================
+# Config
+# ========================
+# POST classification thresholds (ratio = post / pre_baseline)
+GREEN_RATIO_MAX = 1.20     # <= 20% slower than baseline
+YELLOW_RATIO_MAX = 1.50    # 20–50% slower than baseline
+TIMEOUT = 12.0             # seconds before "NO_MOVEMENT"
+
+# Visuals
+WINDOW_TITLE = "Morpheus EVA Fatigue Check (PRE/POST)"
+LINE_Y_FRAC = 0.35         # 0=top, 1=bottom
+LINE_THICKNESS = 3
+
+# Trials
+DEFAULT_N_TRIALS = 3
+REST_BETWEEN_TRIALS_SEC = 1.0
+
+# Camera
+PREFERRED_INDEXES = (0, 1, 2, 3)
+
+# Excel
+EXCEL_PATH = os.path.join(os.path.dirname(__file__) , "morpheus_fatigue_log.xlsx")
+SHEET_TRIALS = "Trials"
+SHEET_SESSIONS = "Sessions"
+
+# Sanity checks
+MIN_VALID_BASELINE_SEC = 0.20  # reject stored baselines below this as invalid
+
+
+# ========================
+# Camera open (cross-platform)
+# ========================
+def open_camera(indexes=PREFERRED_INDEXES):
+    sys = platform.system()
+    if sys == "Darwin":
+        backends = [cv2.CAP_AVFOUNDATION, None]
+    elif sys == "Windows":
+        backends = [cv2.CAP_DSHOW, None]
+    else:
+        backends = [cv2.CAP_V4L2, None]
+
+    for i in indexes:
+        for be in backends:
+            cap = cv2.VideoCapture(i) if be is None else cv2.VideoCapture(i, be)
+            if cap.isOpened():
+                ok, frame = cap.read()
+                if ok and frame is not None:
+                    print(f"[DEBUG] Using camera index {i} on {sys} backend={'default' if be is None else be}")
+                    return cap
+            cap.release()
+    raise RuntimeError("No usable camera found. Close other camera apps or try different indexes.")
+
+
+# ========================
+# Excel helpers
+# ========================
+def ensure_excel_exists(path=EXCEL_PATH):
+    if os.path.exists(path):
+        return
+
+    trials_cols = [
+        "person_id", "session_id", "mode", "trial_num", "timestamp",
+        "delay_sec", "pre_baseline_sec_used",
+        "ratio_vs_pre", "status",
+        "line_y_px", "timeout_flag", "notes"
+    ]
+    sessions_cols = [
+        "person_id", "session_id", "session_date", "mode",
+        "n_trials", "session_median_sec",
+        "pre_baseline_sec_used", "session_vs_pre_ratio",
+        "session_status", "notes"
+    ]
+
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        pd.DataFrame(columns=trials_cols).to_excel(writer, sheet_name=SHEET_TRIALS, index=False)
+        pd.DataFrame(columns=sessions_cols).to_excel(writer, sheet_name=SHEET_SESSIONS, index=False)
+
+
+def append_df_to_sheet(path, sheet_name, df):
+    ensure_excel_exists(path)
+    wb = load_workbook(path)
+
+    if sheet_name not in wb.sheetnames:
+        wb.create_sheet(sheet_name)
+        wb.save(path)
+    wb.close()
+
+    wb = load_workbook(path)
+    ws = wb[sheet_name]
+    last_row = ws.max_row
+    wb.close()
+
+    # If sheet has only header, last_row == 1
+    startrow = last_row if last_row > 1 else 1
+
+    with pd.ExcelWriter(path, engine="openpyxl", mode="a", if_sheet_exists="overlay") as writer:
+        df.to_excel(writer, sheet_name=sheet_name, index=False, header=(startrow == 1), startrow=startrow)
+
+
+def style_trials_sheet(path=EXCEL_PATH):
+    if not os.path.exists(path):
+        return
+
+    wb = load_workbook(path)
+    if SHEET_TRIALS not in wb.sheetnames:
+        wb.close()
+        return
+    ws = wb[SHEET_TRIALS]
+
+    header_fill = PatternFill("solid", fgColor="1F4E79")
+    header_font = Font(color="FFFFFF", bold=True)
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    headers = [c.value for c in ws[1]]
+    if "status" not in headers:
+        wb.close()
+        return
+    status_col = headers.index("status") + 1
+
+    green = PatternFill("solid", fgColor="C6EFCE")
+    yellow = PatternFill("solid", fgColor="FFEB9C")
+    red = PatternFill("solid", fgColor="FFC7CE")
+    gray = PatternFill("solid", fgColor="D9D9D9")
+
+    for r in range(2, ws.max_row + 1):
+        val = ws.cell(row=r, column=status_col).value
+        if val == "GREEN":
+            ws.cell(row=r, column=status_col).fill = green
+        elif val == "YELLOW":
+            ws.cell(row=r, column=status_col).fill = yellow
+        elif val == "RED":
+            ws.cell(row=r, column=status_col).fill = red
+        else:
+            ws.cell(row=r, column=status_col).fill = gray
+
+    wb.save(path)
+    wb.close()
+
+
+def load_pre_baseline(person_id, path=EXCEL_PATH):
+    """
+    Loads the most recent PRE session median for the given person_id.
+    Returns float or None.
+    """
+    if not os.path.exists(path):
+        return None
+
+    try:
+        df = pd.read_excel(path, sheet_name=SHEET_SESSIONS)
+    except Exception:
+        return None
+
+    if df.empty or "person_id" not in df.columns:
+        return None
+
+    dfp = df[(df["person_id"].astype(str) == str(person_id)) & (df["mode"].astype(str).str.upper() == "PRE")].copy()
+    if dfp.empty:
+        return None
+
+    # Prefer most recent by date/session_id
+    if "session_date" in dfp.columns:
+        dfp["session_date"] = pd.to_datetime(dfp["session_date"], errors="coerce")
+        dfp = dfp.sort_values(by=["session_date", "session_id"], ascending=[False, False])
+    else:
+        dfp = dfp.sort_values(by=["session_id"], ascending=False)
+
+    val = dfp.iloc[0].get("session_median_sec", None)
+    try:
+        val = float(val)
+    except Exception:
+        return None
+
+    if val < MIN_VALID_BASELINE_SEC:
+        print(f"[WARN] Stored PRE baseline looks invalid ({val:.6f}s). Re-run PRE for this person.")
+        return None
+
+    return val
+
+
+# ========================
+# Classification
+# ========================
+def classify_post(delay_sec, pre_baseline_sec):
+    if pre_baseline_sec is None or pre_baseline_sec <= 0:
+        return "NO_PRE", None
+
+    ratio = delay_sec / pre_baseline_sec
+    if ratio <= GREEN_RATIO_MAX:
+        return "GREEN", ratio
+    elif ratio <= YELLOW_RATIO_MAX:
+        return "YELLOW", ratio
+    else:
+        return "RED", ratio
+
+
+# ========================
+# Drawing helpers
+# ========================
+def status_color_bgr(status):
+    if status == "GREEN":
+        return (0, 255, 0)
+    if status == "YELLOW":
+        return (0, 255, 255)
+    if status == "RED":
+        return (0, 0, 255)
+    return (200, 200, 200)
+
+
+def draw_target_line(frame, y_px, color_bgr, label="TARGET LINE"):
+    h, w = frame.shape[:2]
+    cv2.line(frame, (0, y_px), (w, y_px), color_bgr, LINE_THICKNESS)
+    cv2.putText(frame, label, (20, max(30, y_px - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_bgr, 2)
+
+
+# ========================
+# MediaPipe Pose init
+# ========================
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose(
+    static_image_mode=False,
+    model_complexity=1,
+    enable_segmentation=False,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
+mp_drawing = mp.solutions.drawing_utils
+
+
+# ========================
+# Trial runner
+# ========================
+def run_session(person_id: str, mode: str, n_trials: int):
+    """
+    mode: "PRE" or "POST"
+    Returns: trials_df, sessions_df
+    """
+    mode = mode.upper().strip()
+    if mode not in ("PRE", "POST"):
+        raise ValueError("mode must be PRE or POST")
+
+    cap = open_camera()
+    session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    session_date = datetime.now().strftime("%Y-%m-%d")
+
+    pre_baseline = load_pre_baseline(person_id) if mode == "POST" else None
+
+    # Get frame size to place line
+    ok, frame = cap.read()
+    if not ok or frame is None:
+        cap.release()
+        raise RuntimeError("Could not read from camera.")
+    frame = cv2.flip(frame, 1)
+    h, w = frame.shape[:2]
+    line_y_px = int(h * LINE_Y_FRAC)
+
+    # Session state
+    trial_num = 1
+    start_time = None
+    movement_done = False
+    last_status = None  # for coloring the line after a trial completes
+    trial_rows = []
+
+    # Helpful instruction text
+    def build_msg():
+        if mode == "PRE":
+            return f"Mode: PRE | Trial {trial_num}/{n_trials} | Raise RIGHT wrist to the line"
+        else:
+            if pre_baseline is None:
+                return f"Mode: POST | No PRE baseline found | Run PRE first"
+            return f"Mode: POST | Trial {trial_num}/{n_trials} | Raise RIGHT wrist to the line"
+
+    msg = build_msg()
+
+    while cap.isOpened():
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            break
+
+        frame = cv2.flip(frame, 1)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose.process(rgb)
+
+        # Line color behavior:
+        # - PRE: always green
+        # - POST: green while waiting; after a trial ends, show GREEN/YELLOW/RED
+        if mode == "PRE":
+            line_color = (0, 255, 0)
+        else:
+            if pre_baseline is None:
+                line_color = (200, 200, 200)
+            else:
+                line_color = status_color_bgr(last_status) if last_status else (0, 255, 0)
+
+        draw_target_line(frame, line_y_px, line_color, label="TARGET LINE (raise wrist here)")
+
+        # UI header
+        cv2.putText(frame, f"Person: {person_id} | Session: {session_id}",
+                    (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(frame, msg,
+                    (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+
+        if results.pose_landmarks:
+            mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+
+            rw = results.pose_landmarks.landmark[mp_pose.PoseLandmark.RIGHT_WRIST]
+            rs = results.pose_landmarks.landmark[mp_pose.PoseLandmark.RIGHT_SHOULDER]
+
+            wrist_px = (int(rw.x * w), int(rw.y * h))
+            shoulder_px = (int(rs.x * w), int(rs.y * h))
+
+            cv2.circle(frame, wrist_px, 10, (0, 0, 255), -1)
+            cv2.circle(frame, shoulder_px, 10, (255, 0, 0), -1)
+
+            # Start timer once pose is visible and trial not done
+            if start_time is None and not movement_done:
+                # Guard against near-zero "instant success":
+                # If wrist already above line at start, wait for it to go BELOW first.
+                if wrist_px[1] <= line_y_px:
+                    cv2.putText(frame, "Lower wrist below the line to start the trial",
+                                (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                else:
+                    start_time = time.time()
+
+            # If running, show elapsed + timeout
+            if start_time is not None and not movement_done:
+                elapsed = time.time() - start_time
+                cv2.putText(frame, f"⏱ {elapsed:.2f}s", (20, 100),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 255), 2)
+
+                if elapsed > TIMEOUT:
+                    # timeout trial
+                    movement_done = True
+                    status = "NO_MOVEMENT"
+                    ratio = None
+                    delay_sec = 0.0
+
+                    trial_rows.append({
+                        "person_id": str(person_id),
+                        "session_id": session_id,
+                        "mode": mode,
+                        "trial_num": trial_num,
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "delay_sec": delay_sec,
+                        "pre_baseline_sec_used": pre_baseline,
+                        "ratio_vs_pre": ratio,
+                        "status": status,
+                        "line_y_px": line_y_px,
+                        "timeout_flag": True,
+                        "notes": f"Timeout > {TIMEOUT:.0f}s"
+                    })
+
+                    msg = f"❗ No movement (>{TIMEOUT:.0f}s). Press SPACE for next trial."
+                    if mode == "POST":
+                        last_status = "RED"
+
+            # Success condition: wrist reaches/crosses target line (y smaller = higher)
+            if start_time is not None and not movement_done:
+                if wrist_px[1] <= line_y_px:
+                    delay_sec = time.time() - start_time
+                    movement_done = True
+
+                    if mode == "PRE":
+                        status = "PRE_TRIAL"
+                        ratio = None
+                        # Line stays green for PRE
+                    else:
+                        status, ratio = classify_post(delay_sec, pre_baseline)
+                        last_status = status if status in ("GREEN", "YELLOW", "RED") else None
+
+                    trial_rows.append({
+                        "person_id": str(person_id),
+                        "session_id": session_id,
+                        "mode": mode,
+                        "trial_num": trial_num,
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "delay_sec": float(delay_sec),
+                        "pre_baseline_sec_used": pre_baseline,
+                        "ratio_vs_pre": ratio,
+                        "status": status,
+                        "line_y_px": line_y_px,
+                        "timeout_flag": False,
+                        "notes": ""
+                    })
+
+                    if mode == "PRE":
+                        msg = f"✅ PRE Trial {trial_num}: {delay_sec:.2f}s. Press SPACE for next trial."
+                    else:
+                        if status in ("GREEN", "YELLOW", "RED") and ratio is not None:
+                            pct = (ratio - 1.0) * 100.0
+                            msg = f"{status} | {delay_sec:.2f}s | {pct:+.0f}% vs PRE. Press SPACE."
+                        else:
+                            msg = f"Trial {trial_num}: {delay_sec:.2f}s. Press SPACE."
+
+        else:
+            cv2.putText(frame, "❗ Move back so I can see your upper body",
+                        (20, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            start_time = None  # don’t count time until pose is visible
+
+        # Footer instruction
+        if movement_done:
+            cv2.putText(frame, "Press SPACE for next trial, or ESC to quit",
+                        (20, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        cv2.imshow(WINDOW_TITLE, frame)
+        key = cv2.waitKey(5) & 0xFF
+
+        if key == 27:  # ESC
+            break
+
+        if key == 32 and movement_done:  # SPACE
+            trial_num += 1
+            if trial_num > n_trials:
+                break
+            # reset trial state
+            start_time = None
+            movement_done = False
+            msg = build_msg()
+            time.sleep(REST_BETWEEN_TRIALS_SEC)
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+    trials_df = pd.DataFrame(trial_rows)
+
+    # Session median (ignore 0.0 timeout trials)
+    valid = trials_df["delay_sec"].replace(0.0, np.nan).dropna()
+    session_median = float(np.median(valid)) if len(valid) else None
+
+    # Determine session-level classification
+    if mode == "PRE":
+        session_status = "PRE_SAVED" if session_median else "NO_DATA"
+        session_vs_pre_ratio = None
+        pre_used = None
+    else:
+        pre_used = pre_baseline
+        if session_median and pre_baseline:
+            session_vs_pre_ratio = session_median / pre_baseline
+            if session_vs_pre_ratio <= GREEN_RATIO_MAX:
+                session_status = "GREEN"
+            elif session_vs_pre_ratio <= YELLOW_RATIO_MAX:
+                session_status = "YELLOW"
+            else:
+                session_status = "RED"
+        else:
+            session_vs_pre_ratio = None
+            session_status = "NO_PRE"
+
+    sessions_df = pd.DataFrame([{
+        "person_id": str(person_id),
+        "session_id": session_id,
+        "session_date": session_date,
+        "mode": mode,
+        "n_trials": int(len(trials_df)),
+        "session_median_sec": session_median,
+        "pre_baseline_sec_used": pre_used,
+        "session_vs_pre_ratio": session_vs_pre_ratio,
+        "session_status": session_status,
+        "notes": ""
+    }])
+
+    return trials_df, sessions_df
+
+
+# ========================
+# Main
+# ========================
+if __name__ == "__main__":
+    person_id = input("Enter person/astronaut ID (e.g., A001): ").strip()
+    if not person_id:
+        raise ValueError("person_id is required.")
+
+    mode_in = input("Mode? Type PRE or POST: ").strip().upper()
+    if mode_in.startswith("PRE"):
+        mode = "PRE"
+    elif mode_in.startswith("POST"):
+        mode="POST"
+    else:
+        raise ValueError ("Invalid mode. Type PRE or POST.")
+
+    n_trials_in = input(f"How many trials? (default {DEFAULT_N_TRIALS}): ").strip()
+    try:
+        n_trials = int(n_trials_in) if n_trials_in else DEFAULT_N_TRIALS
+        n_trials = max(1, n_trials)
+    except Exception:
+        n_trials = DEFAULT_N_TRIALS
+
+    print(f"\n[INFO] Running {mode} for person {person_id} with {n_trials} trials.")
+    trials_df, sessions_df = run_session(person_id, mode, n_trials)
+
+    ensure_excel_exists(EXCEL_PATH)
+    append_df_to_sheet(EXCEL_PATH, SHEET_TRIALS, trials_df)
+    append_df_to_sheet(EXCEL_PATH, SHEET_SESSIONS, sessions_df)
+    style_trials_sheet(EXCEL_PATH)
+
+    # Print session result
+    print("\n==== SESSION RESULT ====")
+    print(f"Person: {person_id}")
+    print(f"Mode:   {mode}")
+    print(f"Excel:  {os.path.abspath(EXCEL_PATH)}")
+
+    if not trials_df.empty:
+        print("\nTrials:")
+        cols = ["trial_num", "delay_sec", "status", "ratio_vs_pre"]
+        print(trials_df[cols].to_string(index=False))
+
+    print("\nSession Summary:")
+    med = sessions_df.loc[0, "session_median_sec"]
+    pre_used = sessions_df.loc[0, "pre_baseline_sec_used"]
+    ratio = sessions_df.loc[0, "session_vs_pre_ratio"]
+    status = sessions_df.loc[0, "session_status"]
+
+    print(f"Session median: {med if pd.notna(med) else 'N/A'} sec")
+    print(f"PRE baseline used: {pre_used if pd.notna(pre_used) else 'N/A'} sec")
+    if pd.notna(ratio):
+        print(f"Session vs PRE ratio: {ratio:.3f}  ({(ratio-1)*100:+.0f}%)")
+    else:
+        print("Session vs PRE ratio: N/A")
+    print(f"Session status: {status}")
+
+    if mode == "POST" and pre_used is None:
+        print("\n[NOTE] No PRE baseline found for this person. Run PRE first to enable GREEN/YELLOW/RED classification.")
+
+    print("\nDone.")
+
+
+
